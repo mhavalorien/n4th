@@ -1,6 +1,6 @@
 -- Loader tetap: cek commit terbaru, lalu ambil script dari URL commit tersebut.
 assert(type(loadstring) == "function", "[n4th] Executor tidak menyediakan loadstring setelah update.")
-local repository = "ZennJxD/n4th"
+local repository = "mhavalorien/n4th"
 local httpService = game:GetService("HttpService")
 local lastError = "respons kosong"
 
