@@ -8086,44 +8086,78 @@ end
 
 -- Pukul 1 tile sampai bersih (block dulu, lalu background).
 -- Hasil: "done" | "fall" (karakter jatuh) | "skip" | "stop"
+-- Fungsi bantu: dorong langkah ke target X secara mulus saat memukul tanpa blocking
+local function stepToward(targetX)
+    local s = playerState()
+    if not s or not s.grounded then return end
+    local cx = targetX + 0.5
+    local dx = cx - s.x
+    if math.abs(dx) > 0.15 then
+        AutoInput.active = true
+        AutoInput.left = dx < 0
+        AutoInput.right = dx > 0
+    else
+        AutoInput.left = false
+        AutoInput.right = false
+    end
+end
+
+-- Pukul 1 tile sampai bersih (block dulu, lalu background) sambil terus melangkah mendekat.
+-- Hasil: "done" | "fall" (karakter jatuh) | "skip" | "stop"
 function Build.carveTile(t, live)
     local hits, maxHits = 0, nil
+    local nextPunch = 0
     while live() and alive() do
         local layer = Build.carveLayer(t.x, t.y, Refs.World.w)
-        if not layer then return "done" end
+        if not layer then
+            AutoInput.left, AutoInput.right = false, false
+            return "done"
+        end
         local id = (layer == "fg") and fgIdAt(t.x, t.y) or (tileAt("bg", t.x, t.y) or 0)
         maxHits = maxHits or (hitsNeeded(id) * 3 + 6)
-        local r = tryBreak(t.x, t.y, layer == "bg")
-        if r == nil then
-            skipTile(Build.Skip, t.idx, 60)
-            return "skip"
-        end
-        if r == "broke" then
-            if layer == "fg" then Build.Carved[t.idx] = true end
-            Build.Dug += 1
-            Build.Status = ("Gali %s (%d,%d)"):format(itemName(id), t.x, t.y)
-            local bt = (Build.BreakTimes[t.idx] or 0) + 1
-            Build.BreakTimes[t.idx] = bt
-            if bt > 8 then -- server terus mengembalikan tile ini
-                skipTile(Build.Skip, t.idx, 120)
+
+        -- Melangkah ke arah blok tujuan selama jeda pukulan
+        stepToward(t.x)
+
+        if os.clock() >= nextPunch then
+            local r = tryBreak(t.x, t.y, layer == "bg")
+            if r == nil then
+                skipTile(Build.Skip, t.idx, 60)
+                AutoInput.left, AutoInput.right = false, false
                 return "skip"
             end
-            hits, maxHits = 0, nil
-            local s = playerState()
-            if not s or not s.grounded then
-                waitAuto(State.BreakMs)
-                return "fall"
+            if r == "broke" then
+                if layer == "fg" then Build.Carved[t.idx] = true end
+                Build.Dug += 1
+                Build.Status = ("Gali %s (%d,%d)"):format(itemName(id), t.x, t.y)
+                local bt = (Build.BreakTimes[t.idx] or 0) + 1
+                Build.BreakTimes[t.idx] = bt
+                if bt > 8 then -- server terus mengembalikan tile ini
+                    skipTile(Build.Skip, t.idx, 120)
+                    AutoInput.left, AutoInput.right = false, false
+                    return "skip"
+                end
+                hits, maxHits = 0, nil
+                local s = playerState()
+                if not s or not s.grounded then
+                    AutoInput.left, AutoInput.right = false, false
+                    waitAuto(State.BreakMs)
+                    return "fall"
+                end
+            else
+                hits += 1
+                Build.Status = ("Pukul %s (%d,%d)"):format(itemName(id), t.x, t.y)
+                if hits > maxHits then
+                    skipTile(Build.Skip, t.idx, 45)
+                    AutoInput.left, AutoInput.right = false, false
+                    return "skip"
+                end
             end
-        else
-            hits += 1
-            Build.Status = ("Pukul %s (%d,%d)"):format(itemName(id), t.x, t.y)
-            if hits > maxHits then
-                skipTile(Build.Skip, t.idx, 45)
-                return "skip"
-            end
+            nextPunch = os.clock() + (State.BreakMs / 1000)
         end
-        if not waitAuto(State.BreakMs) then return "stop" end
+        task.wait()
     end
+    AutoInput.left, AutoInput.right = false, false
     return "stop"
 end
 
@@ -8135,11 +8169,10 @@ function Build.fillTile(t)
         Build.Status = ("Pecah %s di lantai (%d,%d)"):format(itemName(id), t.x, t.y)
         for _ = 1, 40 do
             local r = tryBreak(t.x, t.y, false)
-            if r == nil then
-                skipTile(Build.Skip, t.idx, 60)
-                return "skip"
+            if r == nil then break end -- tidak bisa dipecah (lock, pintu, dll)
+            if r == "broke" then
+                break
             end
-            if r == "broke" then break end
             if not waitAuto(State.BreakMs) then return "stop" end
         end
         local cur = playerState()
@@ -8157,7 +8190,8 @@ function Build.fillTile(t)
     return "done"
 end
 
--- 1 langkah gali. Hasil: "work" | "move" | "wait" | "none"
+-- 1 langkah gali dinamis: terus bergerak ke blok terdekat dan menghancurkannya secara lancar.
+-- Hasil: "work" | "move" | "wait" | "none"
 function Build.carveStep(P, list, live)
     local w = Refs.World
     local s = playerState()
@@ -8173,7 +8207,7 @@ function Build.carveStep(P, list, live)
         return "wait"
     end
     Move.AirAt = nil
-    releaseInput()
+
     local R = punchReach() - 0.08
     local now = os.clock()
     local fi = nil
@@ -8183,49 +8217,55 @@ function Build.carveStep(P, list, live)
             break
         end
     end
-    if not fi then return "none" end
-    -- pecah yang terjangkau dari sini sesuai urutan (berhenti di tile pertama yang tidak terjangkau)
-    local did = 0
-    for j = fi, math.min(#list, fi + 5) do
-        local t = list[j]
-        if not skipped(Build.Skip, t.idx, now) then
-            local cur = playerState()
-            if not cur or cur.dead or not cur.grounded or not stateReaches(cur, t.x, t.y, R) then break end
-            if t.kind == "fill" and overlapsPlayer(t.x, t.y, cur) then break end -- berdiri di lubangnya: pindah dulu
-            if not canWorkAt(t.x, t.y) then
-                skipTile(Build.Skip, t.idx, 300) -- dikunci orang lain
-            elseif t.kind == "fill" then
-                did += 1
-                if Build.fillTile(t) ~= "done" then break end
-            else
-                -- block pijakan sendiri: pecah hanya kalau jatuhnya pendek & aman
-                local foot = floor(cur.y + 0.01)
-                if t.y == foot and t.x >= floor(cur.x - 0.3) and t.x <= floor(cur.x + 0.3 - 0.0001) then
-                    local d = fallAfterBreak(cur, t.x, foot)
-                    if d == nil or d > 3 then
-                        skipTile(Build.Skip, t.idx, 20)
-                        break
-                    end
-                end
-                did += 1
-                if Build.carveTile(t, live) ~= "done" then break end
+    if not fi then
+        releaseInput()
+        return "none"
+    end
+
+    local target = list[fi]
+
+    -- Jika target masuk jangkauan pukul, pecahkan sambil terus bergerak
+    if stateReaches(s, target.x, target.y, R) then
+        if not canWorkAt(target.x, target.y) then
+            skipTile(Build.Skip, target.idx, 300)
+            return "work"
+        end
+
+        if target.kind == "fill" then
+            if overlapsPlayer(target.x, target.y, s) then
+                stepToward(target.x + 1)
+                task.wait(0.1)
+                return "move"
             end
+            Build.fillTile(target)
+            return "work"
+        else
+            -- Block pijakan sendiri: pecah hanya kalau jatuhnya pendek & aman
+            local foot = floor(s.y + 0.01)
+            if target.y == foot and target.x >= floor(s.x - 0.3) and target.x <= floor(s.x + 0.3 - 0.0001) then
+                local d = fallAfterBreak(s, target.x, foot)
+                if d == nil or d > 3 then
+                    skipTile(Build.Skip, target.idx, 20)
+                    return "work"
+                end
+            end
+            Build.carveTile(target, live)
+            return "work"
         end
     end
-    if did > 0 then return "work" end
-    local F = list[fi]
-    local r = Build.goNear({ F }, math.min(punchReach(), buildReach()) - 0.35, nil, F.kind == "fill")
+
+    -- Jika belum sampai dalam jangkauan pukul, navigasi cepat ke target
+    local r = Build.goNear({ target }, math.min(punchReach(), buildReach()) - 0.35, nil, target.kind == "fill")
     if r == "nopath" then
         -- belum ada jalan ke sini: lewati sebaris dulu (tidak cari jalan berulang per tile)
         for _, t in ipairs(list) do
-            if t.y == F.y then skipTile(Build.Skip, t.idx, 30) end
+            if t.y == target.y then skipTile(Build.Skip, t.idx, 30) end
         end
         return "move"
     end
     return r
 end
 
--- Tile masuk baris: block di samping lubang tangga (block pertama baris dipasang dari sini)
 function Build.entries(P, k)
     local e = {}
     local holes, L = P.holes[k], P.isLand[k]
